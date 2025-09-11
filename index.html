@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shadow Stealth - AI (Debug)</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #1a1a1a;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        #game-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        canvas {
+            background-color: #000;
+            border: 2px solid #444;
+            border-radius: 8px;
+        }
+        #status {
+            margin-top: 15px;
+            font-size: 1.2em;
+            font-weight: bold;
+            min-height: 1.5em;
+            color: #ffc107; /* Debug color */
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="gameCanvas"></canvas>
+        <div id="status">페이지 로딩 완료</div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+
+        // --- 환경 설정 (Python 환경과 동기화) ---
+        const SCREEN_WIDTH = 1280;
+        const SCREEN_HEIGHT = 720;
+        const CELL_SIZE = 40;
+
+        canvas.width = SCREEN_WIDTH;
+        canvas.height = SCREEN_HEIGHT;
+
+        const PLAYER_SPEED = 4.0;
+        const ENEMY_SPEED = 1.8;
+        const LIGHT_EXPOSURE_LIMIT = 0.7; // 초
+
+        // --- LIDAR 및 관측 공간 설정 ---
+        const LIDAR_RAYS = 36;
+        const LIDAR_MAX_DIST = 1000;
+        const TYPE_ID = {
+            "NOTHING": 0, "WALL": 1, "ENEMY": 2, "EXIT": 3, "PUDDLE": 4, "LIGHT": 5,
+        };
+
+        // --- 게임 상태 변수 ---
+        let player, exit, walls, puddles, towers, enemies;
+        let lightExposure = 0;
+        let lightPolygons = [];
+        let difficulty = 0;
+        let ortSession;
+        let gameRunning = true;
+
+        // --- 유틸리티 함수 ---
+        const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+        const randFloat = (min, max) => Math.random() * (max - min) + min;
+        const choice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+        function isPointInPolygon(point, polygon) {
+            const { x, y } = point;
+            let isInside = false;
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                const xi = polygon[i].x, yi = polygon[i].y;
+                const xj = polygon[j].x, yj = polygon[j].y;
+                const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+                if (intersect) isInside = !isInside;
+            }
+            return isInside;
+        }
+        
+        function lineIntersectCircle(p1, p2, circle) {
+            let dp = { x: p2.x - p1.x, y: p2.y - p1.y };
+            let f = { x: p1.x - circle.pos.x, y: p1.y - circle.pos.y };
+
+            let a = dp.x * dp.x + dp.y * dp.y;
+            let b = 2 * (f.x * dp.x + f.y * dp.y);
+            let c = f.x * f.x + f.y * f.y - circle.radius * circle.radius;
+
+            let discriminant = b * b - 4 * a * c;
+            if (discriminant < 0) return null;
+
+            discriminant = Math.sqrt(discriminant);
+            let t1 = (-b - discriminant) / (2 * a);
+            let t2 = (-b + discriminant) / (2 * a);
+
+            if (t1 >= 0 && t1 <= 1) return {x: p1.x + t1 * dp.x, y: p1.y + t1 * dp.y};
+            if (t2 >= 0 && t2 <= 1) return {x: p1.x + t2 * dp.x, y: p1.y + t2 * dp.y};
+            return null;
+        }
+
+        function lineIntersectRect(p1, p2, rect) {
+            const { x, y, w, h } = rect;
+            const lines = [
+                [{x, y}, {x: x + w, y}],
+                [{x: x + w, y}, {x: x + w, y: y + h}],
+                [{x: x + w, y: y + h}, {x, y: y + h}],
+                [{x, y: y + h}, {x, y}]
+            ];
+            let closestIntersect = null;
+            let min_dist_sq = Infinity;
+
+            for(const line of lines) {
+                const p3 = line[0], p4 = line[1];
+                const den = (p1.x - p2.x) * (p3.y - p4.y) - (p1.y - p2.y) * (p3.x - p4.x);
+                if (den === 0) continue;
+                const t = ((p1.x - p3.x) * (p3.y - p4.y) - (p1.y - p3.y) * (p3.x - p4.x)) / den;
+                const u = -((p1.x - p2.x) * (p1.y - p3.y) - (p1.y - p2.y) * (p1.x - p3.x)) / den;
+
+                if (t > 0 && t < 1 && u > 0 && u < 1) {
+                    const pt = { x: p1.x + t * (p2.x - p1.x), y: p1.y + t * (p2.y - p1.y) };
+                    const dist_sq = (pt.x - p1.x)**2 + (pt.y - p1.y)**2;
+                    if(dist_sq < min_dist_sq) {
+                        min_dist_sq = dist_sq;
+                        closestIntersect = pt;
+                    }
+                }
+            }
+            return closestIntersect;
+        }
+
+        // --- 게임 로직 ---
+        function generateLevel(difficulty) {
+            const player_start = { x: 80, y: SCREEN_HEIGHT / 2 };
+            const exit_rect = { x: SCREEN_WIDTH - 120, y: SCREEN_HEIGHT / 2 - 30, w: 60, h: 60 };
+            
+            const max_walls = 10 + difficulty * 2;
+            const generated_walls = [];
+            for (let i = 0; i < max_walls; i++) {
+                generated_walls.push({
+                    x: randInt(CELL_SIZE * 2, SCREEN_WIDTH - CELL_SIZE * 8),
+                    y: randInt(0, SCREEN_HEIGHT - CELL_SIZE * 6),
+                    w: randInt(CELL_SIZE * 2, CELL_SIZE * 6),
+                    h: randInt(CELL_SIZE * 2, CELL_SIZE * 6)
+                });
+            }
+
+            const open_spaces = [];
+            for(let i=0; i<500; i++) {
+                const x = randInt(0, SCREEN_WIDTH);
+                const y = randInt(0, SCREEN_HEIGHT);
+                let on_wall = generated_walls.some(w => x > w.x && x < w.x + w.w && y > w.y && y < w.y + w.h);
+                if(!on_wall) open_spaces.push({x, y});
+            }
+            if(open_spaces.length === 0) open_spaces.push({x: 200, y: 200});
+
+            const num_towers = Math.min(open_spaces.length, 1 + difficulty);
+            const generated_towers = [];
+            for(let i=0; i<num_towers; i++) {
+                generated_towers.push({
+                    pos: choice(open_spaces),
+                    angle: randInt(0, 360),
+                    speed: randFloat(0.5, 1.0) * choice([-1, 1]),
+                    cone_angle: randInt(25, 40),
+                    radius: randInt(300, 450)
+                });
+            }
+
+            const num_puddles = Math.min(open_spaces.length, 5 + difficulty * 2);
+            const generated_puddles = [];
+             for(let i=0; i<num_puddles; i++) {
+                generated_puddles.push({
+                    x: choice(open_spaces).x, y: choice(open_spaces).y,
+                    w: CELL_SIZE, h: CELL_SIZE
+                });
+            }
+
+            const num_enemies = Math.min(open_spaces.length, difficulty);
+            const generated_enemies = [];
+            for(let i=0; i<num_enemies; i++) {
+                generated_enemies.push({
+                    pos: choice(open_spaces),
+                    radius: 15
+                });
+            }
+
+            return { player_start, exit: exit_rect, walls: generated_walls, puddles: generated_puddles, towers: generated_towers, enemies: generated_enemies };
+        }
+
+        function resetGame() {
+            gameRunning = false;
+            statusDiv.textContent = `레벨 ${difficulty + 1} 생성 중...`;
+            const level = generateLevel(difficulty);
+            player = { pos: { ...level.player_start }, radius: 12 };
+            exit = level.exit;
+            walls = level.walls;
+            puddles = level.puddles;
+            towers = level.towers;
+            enemies = level.enemies;
+            lightExposure = 0;
+            setTimeout(() => { gameRunning = true; }, 500); // Allow some time before starting
+        }
+
+        function getObservation() {
+            const lidarData = scanLidar(); 
+            const flatLidarData = lidarData.flat();
+
+            const isInPuddle = puddles.some(p => 
+                player.pos.x > p.x && player.pos.x < p.x + p.w &&
+                player.pos.y > p.y && player.pos.y < p.y + p.h
+            ) ? 1.0 : 0.0;
+
+            const lightExposureRatio = Math.min(lightExposure / LIGHT_EXPOSURE_LIMIT, 1.0);
+
+            return new Float32Array([...flatLidarData, isInPuddle, lightExposureRatio]);
+        }
+
+        function scanLidar() {
+            const obs = Array(LIDAR_RAYS).fill(0).map(() => [1.0, TYPE_ID.NOTHING]);
+
+            for (let i = 0; i < LIDAR_RAYS; i++) {
+                const angle = (2 * Math.PI / LIDAR_RAYS) * i;
+                const rayDir = { x: Math.cos(angle), y: Math.sin(angle) };
+                const rayEnd = { x: player.pos.x + rayDir.x * LIDAR_MAX_DIST, y: player.pos.y + rayDir.y * LIDAR_MAX_DIST };
+                
+                let min_dist_sq = LIDAR_MAX_DIST**2;
+                let closest_type = TYPE_ID.NOTHING;
+
+                for (const wall of walls) {
+                    const intersect = lineIntersectRect(player.pos, rayEnd, wall);
+                    if (intersect) {
+                        const dist_sq = (intersect.x - player.pos.x)**2 + (intersect.y - player.pos.y)**2;
+                        if (dist_sq < min_dist_sq) {
+                            min_dist_sq = dist_sq;
+                            closest_type = TYPE_ID.WALL;
+                        }
+                    }
+                }
+                
+                for (const enemy of enemies) {
+                    const intersect = lineIntersectCircle(player.pos, rayEnd, enemy);
+                     if (intersect) {
+                        const dist_sq = (intersect.x - player.pos.x)**2 + (intersect.y - player.pos.y)**2;
+                        if (dist_sq < min_dist_sq) {
+                            min_dist_sq = dist_sq;
+                            closest_type = TYPE_ID.ENEMY;
+                        }
+                    }
+                }
+
+                const exitIntersect = lineIntersectRect(player.pos, rayEnd, exit);
+                if (exitIntersect) {
+                    const dist_sq = (exitIntersect.x - player.pos.x)**2 + (exitIntersect.y - player.pos.y)**2;
+                    if (dist_sq < min_dist_sq) {
+                        min_dist_sq = dist_sq;
+                        closest_type = TYPE_ID.EXIT;
+                    }
+                }
+                
+                for (const puddle of puddles) {
+                    const intersect = lineIntersectRect(player.pos, rayEnd, puddle);
+                    if (intersect) {
+                        const dist_sq = (intersect.x - player.pos.x)**2 + (intersect.y - player.pos.y)**2;
+                        if (dist_sq < min_dist_sq) {
+                            min_dist_sq = dist_sq;
+                            closest_type = TYPE_ID.PUDDLE;
+                        }
+                    }
+                }
+
+                obs[i][0] = Math.sqrt(min_dist_sq) / LIDAR_MAX_DIST;
+                obs[i][1] = closest_type;
+            }
+            return obs;
+        }
+
+        function calculateLightPolygons() {
+            const polygons = [];
+            for (const tower of towers) {
+                const p = [];
+                const towerAngleRad = tower.angle * Math.PI / 180;
+                const coneHalfAngleRad = (tower.cone_angle / 2) * Math.PI / 180;
+                
+                p.push({x: tower.pos.x, y: tower.pos.y});
+                
+                const angle1 = towerAngleRad - coneHalfAngleRad;
+                p.push({
+                    x: tower.pos.x + tower.radius * Math.cos(angle1),
+                    y: tower.pos.y + tower.radius * Math.sin(angle1)
+                });
+
+                const angle2 = towerAngleRad + coneHalfAngleRad;
+                 p.push({
+                    x: tower.pos.x + tower.radius * Math.cos(angle2),
+                    y: tower.pos.y + tower.radius * Math.sin(angle2)
+                });
+
+                polygons.push(p);
+            }
+            return polygons;
+        }
+
+        function update(action) {
+            const direction = { x: 0, y: 0 };
+            if (action === 0) { direction.y = -1; }
+            else if (action === 1) { direction.y = -1; direction.x = 1; }
+            else if (action === 2) { direction.x = 1; }
+            else if (action === 3) { direction.y = 1; direction.x = 1; }
+            else if (action === 4) { direction.y = 1; }
+            else if (action === 5) { direction.y = 1; direction.x = -1; }
+            else if (action === 6) { direction.x = -1; }
+            else if (action === 7) { direction.y = -1; direction.x = -1; }
+            
+            if (direction.x !== 0 || direction.y !== 0) {
+                const mag = Math.sqrt(direction.x**2 + direction.y**2);
+                direction.x = direction.x / mag * PLAYER_SPEED;
+                direction.y = direction.y / mag * PLAYER_SPEED;
+            }
+
+            player.pos.x += direction.x;
+            player.pos.y += direction.y;
+
+            for (const wall of walls) {
+                if (player.pos.x + player.radius > wall.x && player.pos.x - player.radius < wall.x + wall.w &&
+                    player.pos.y + player.radius > wall.y && player.pos.y - player.radius < wall.y + wall.h) {
+                    player.pos.x -= direction.x;
+                    player.pos.y -= direction.y;
+                    break;
+                }
+            }
+            player.pos.x = Math.max(player.radius, Math.min(SCREEN_WIDTH - player.radius, player.pos.x));
+            player.pos.y = Math.max(player.radius, Math.min(SCREEN_HEIGHT - player.radius, player.pos.y));
+
+            const isInPuddle = puddles.some(p => 
+                player.pos.x > p.x && player.pos.x < p.x + p.w &&
+                player.pos.y > p.y && player.pos.y < p.y + p.h
+            );
+
+            towers.forEach(t => t.angle = (t.angle + t.speed) % 360);
+            lightPolygons = calculateLightPolygons();
+
+            enemies.forEach(enemy => {
+                const dist = Math.hypot(player.pos.x - enemy.pos.x, player.pos.y - enemy.pos.y);
+                if (dist < 300 && !isInPuddle) {
+                    const dir = { x: player.pos.x - enemy.pos.x, y: player.pos.y - enemy.pos.y };
+                    const mag = Math.sqrt(dir.x**2 + dir.y**2);
+                    enemy.pos.x += dir.x / mag * ENEMY_SPEED;
+                    enemy.pos.y += dir.y / mag * ENEMY_SPEED;
+                }
+            });
+
+            const isInLight = lightPolygons.some(poly => isPointInPolygon(player.pos, poly));
+            if (isInLight && !isInPuddle) {
+                lightExposure += 1 / 60; 
+                if (lightExposure > LIGHT_EXPOSURE_LIMIT) {
+                    statusDiv.textContent = "빛에 발각! 레벨 재시작...";
+                    difficulty = Math.max(0, difficulty -1);
+                    setTimeout(resetGame, 1500);
+                    return;
+                }
+            } else {
+                lightExposure = Math.max(0, lightExposure - 1/60);
+            }
+
+            for (const enemy of enemies) {
+                if (Math.hypot(player.pos.x - enemy.pos.x, player.pos.y - enemy.pos.y) < player.radius + enemy.radius) {
+                    statusDiv.textContent = "적에게 발각! 레벨 재시작...";
+                    difficulty = Math.max(0, difficulty -1);
+                    setTimeout(resetGame, 1500);
+                    return;
+                }
+            }
+
+            if (player.pos.x > exit.x && player.pos.x < exit.x + exit.w &&
+                player.pos.y > exit.y && player.pos.y < exit.y + exit.h) {
+                statusDiv.textContent = "레벨 클리어! 다음 레벨로...";
+                difficulty++;
+                setTimeout(resetGame, 1500);
+                return;
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+
+            if (!player) return;
+
+            lightPolygons.forEach(poly => {
+                ctx.beginPath();
+                ctx.moveTo(poly[0].x, poly[0].y);
+                for (let i = 1; i < poly.length; i++) {
+                    ctx.lineTo(poly[i].x, poly[i].y);
+                }
+                ctx.closePath();
+                ctx.fillStyle = 'rgba(255, 255, 0, 0.1)';
+                ctx.fill();
+            });
+
+            ctx.fillStyle = '#cc2222';
+            walls.forEach(w => ctx.fillRect(w.x, w.y, w.w, w.h));
+
+            ctx.fillStyle = 'rgba(74, 90, 121, 0.6)';
+            puddles.forEach(p => ctx.fillRect(p.x, p.y, p.w, p.h));
+
+            ctx.fillStyle = '#a2ff00';
+            ctx.fillRect(exit.x, exit.y, exit.w, exit.h);
+
+            ctx.fillStyle = '#fff';
+            towers.forEach(t => {
+                ctx.beginPath();
+                ctx.arc(t.pos.x, t.pos.y, 10, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+
+            ctx.fillStyle = '#ff0055';
+            enemies.forEach(e => {
+                ctx.beginPath();
+                ctx.arc(e.pos.x, e.pos.y, e.radius, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+
+            ctx.fillStyle = '#00ffdd';
+            ctx.beginPath();
+            ctx.arc(player.pos.x, player.pos.y, player.radius, 0, 2 * Math.PI);
+            ctx.fill();
+            
+            if (lightExposure > 0) {
+                const barWidth = 100;
+                const ratio = Math.min(lightExposure / LIGHT_EXPOSURE_LIMIT, 1.0);
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                ctx.fillRect(player.pos.x - barWidth/2, player.pos.y - player.radius - 15, barWidth, 5);
+                ctx.fillStyle = 'rgba(255, 100, 0, 0.8)';
+                ctx.fillRect(player.pos.x - barWidth/2, player.pos.y - player.radius - 15, barWidth * ratio, 5);
+            }
+        }
+
+        async function gameLoop() {
+            if (gameRunning) {
+                statusDiv.textContent = '게임 루프: 관측 데이터 생성 중...';
+                const observation = getObservation();
+                const tensor = new ort.Tensor('float32', observation, [1, 74]);
+
+                statusDiv.textContent = '게임 루프: AI 추론 실행 중...';
+                const results = await ortSession.run({ 'observation': tensor });
+                const actionProbabilities = results.action.data;
+                
+                const action = actionProbabilities.indexOf(Math.max(...actionProbabilities));
+
+                statusDiv.textContent = '게임 루프: 게임 상태 업데이트 중...';
+                update(action);
+
+                statusDiv.textContent = '게임 루프: 화면 그리는 중...';
+                draw();
+            }
+            
+            requestAnimationFrame(gameLoop);
+        }
+
+        async function main() {
+            try {
+                statusDiv.textContent = 'main(): ONNX 런타임 초기화 중...';
+                ortSession = await ort.InferenceSession.create('./model.onnx');
+                
+                statusDiv.textContent = 'main(): 모델 로딩 완료. 게임 리셋 중...';
+                resetGame();
+                
+                statusDiv.textContent = 'main(): 게임 루프 시작.';
+                gameLoop();
+
+            } catch (e) {
+                statusDiv.textContent = `치명적 오류: ${e.message}. model.onnx 파일 경로와 유효성을 확인하세요.`;
+                console.error(e);
+            }
+        }
+
+        main();
+    </script>
+</body>
+</html>
