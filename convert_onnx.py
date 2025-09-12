@@ -47,6 +47,7 @@ def convert_model_to_onnx():
             opset_version=11, # 웹 환경과 호환성을 위해 12 버전을 사용
             input_names=['observation'],
             output_names=['action'],
+            do_constant_folding=False, # 웹 호환성을 위해 최적화 옵션 비활성화
             dynamic_axes={
                 'observation': {0: 'batch_size'},
                 'action': {0: 'batch_size'}

@@ -42,7 +42,7 @@
         <div id="status">페이지 로딩 완료</div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.0/dist/ort.min.js"></script>
     <script>
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
@@ -457,9 +457,7 @@
 
                 statusDiv.textContent = '게임 루프: AI 추론 실행 중...';
                 const results = await ortSession.run({ 'observation': tensor });
-                const actionProbabilities = results.action.data;
-                
-                const action = actionProbabilities.indexOf(Math.max(...actionProbabilities));
+                const action = Number(results.action.data[0]);
 
                 statusDiv.textContent = '게임 루프: 게임 상태 업데이트 중...';
                 update(action);
